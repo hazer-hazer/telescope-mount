@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Telescope controls</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" type="image/png" href="">
+</head>
+
+<body>
+    <div class="main">
+        <div id="message"></div>
+        <div class="screen scan-screen">
+            <div class="btn" id="scan-btn">Scan</div>
+
+            <div id="scan-list"></div>
+        </div>
+    </div>
+</body>
+
+<script>
+    const makeBtn = (text, classes, onClick) => {
+        const btn = document.createElement('div')
+        btn.addEventListener('click', onClick)
+        btn.classList.add('btn', ...classes)
+        btn
+    }
+
+    const message = document.querySelector('#message')
+
+    const showMessage = (text) => {
+        message.innerHTML = message
+        message.style.visibility = 'visible'
+    }
+    const hideMessage = () => {
+        message.style.visibility = 'hidden'
+    }
+
+    // Connection screen //
+    const scanBtn = document.querySelector('#scan-btn')
+    const scanList = document.querySelector('#scan-list')
+
+    scanBtn.addEventListener('click', async () => {
+        if (!navigator.bluetooth || !await navigator.bluetooth.getAvailability()) {
+            // showMessage('Bluetooth is unavailable')
+            alert('Bluetooth is not available on this device')
+            return
+        }
+
+        try {
+            const btPermission = await navigator.permissions.query({ name: "bluetooth" });
+            if (btPermission.state === "denied") {
+                alert('This app does not work without bluetooth, please allow it in your browser')
+                return
+            }
+        } catch (err) {
+            console.error(err)
+            alert('An error occurred trying to enable bluetooth, please ensure you turned on bluetooth feature in your browser. Windows is not supported though. (in chrome it\'s inside chrome://flags/)')
+            return;
+        }
+
+        console.log('scan', navigator.bluetooth);
+
+        const devices = await navigator.bluetooth.getDevices();
+
+        console.log('devices:', devices)
+    });
+</script>
+
+</html>

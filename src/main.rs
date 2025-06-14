@@ -1,9 +1,13 @@
 #![no_std]
 #![no_main]
+#![deny(unused_must_use)]
 
-use core::cell::{Cell, RefCell};
-
-use alloc::format;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::{self, Vec},
+};
+use as5600::asynch::As5600;
 use bleps::{
     ad_structure::{
         create_advertising_data, AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE,
@@ -14,9 +18,16 @@ use bleps::{
     attribute_server::NotificationData,
     gatt,
 };
+use core::cell::{Cell, RefCell};
 use embassy_executor::Spawner;
+use embassy_futures::block_on;
 use embassy_net::{dns::DnsQueryType, tcp::TcpSocket, Runner, StackResources};
-use embassy_sync::{blocking_mutex::CriticalSectionMutex, mutex::Mutex};
+use embassy_sync::{
+    blocking_mutex::{raw::CriticalSectionRawMutex, CriticalSectionMutex},
+    mutex::Mutex,
+    signal::Signal,
+    watch::Watch,
+};
 use embassy_time::{Duration, Ticker, Timer};
 use embedded_graphics::Drawable;
 use embedded_graphics::{
@@ -30,7 +41,7 @@ use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     esp_riscv_rt::entry,
-    gpio::{Input, InputConfig, Io, Output, OutputConfig, Pull},
+    gpio::{Input, InputConfig, Io, NoPin, Output, OutputConfig, Pull},
     i2c::master::I2c,
     peripherals::{BT, I2C0},
     rng::Rng,
@@ -45,6 +56,7 @@ use esp_wifi::{
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
     EspWifiController,
 };
+use futures::StreamExt;
 use log::{debug, error, info};
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig},
@@ -59,6 +71,15 @@ use ssd1306::{
 use static_cell::StaticCell;
 use uln2003::{StepperMotor, ULN2003};
 
+use crate::{
+    gy87::Gy87,
+    stepper::{a4988::A4988, Stepper, StepperConfig},
+};
+
+mod gy87;
+mod stepper;
+
+#[macro_use]
 extern crate alloc;
 
 macro_rules! mk_static {
@@ -77,35 +98,49 @@ type Display = ssd1306::Ssd1306<
     BufferedGraphicsMode<DisplaySize>,
 >;
 
-static POSITION: CriticalSectionMutex<Cell<i32>> = CriticalSectionMutex::new(Cell::new(0));
+// static POSITION: CriticalSectionMutex<Cell<i32>> = CriticalSectionMutex::new(Cell::new(0));
 
-#[embassy_executor::task]
-async fn ui_task(mut display: Display) {
-    display
-        .init_with_addr_mode(ssd1306::command::AddrMode::Horizontal)
-        .unwrap();
-    display.clear_buffer();
-    display.set_display_on(true).unwrap();
+static POSITION: Watch<CriticalSectionRawMutex, i32, 2> = Watch::new();
 
-    loop {
-        display.clear_buffer();
+pub async fn list_i2c_devices<'a>(i2c: &'a mut impl embedded_hal_async::i2c::I2c) -> Vec<String> {
+    let mut addresses = vec![];
 
-        let pos = critical_section::with(|cs| POSITION.borrow(cs).get());
-        embedded_graphics::text::Text::new(
-            &format!("POS: {}", pos),
-            Point::new(0, 0),
-            MonoTextStyleBuilder::new()
-                .text_color(BinaryColor::On)
-                .font(&ascii::FONT_5X8)
-                .build(),
-        )
-        .draw(&mut display)
-        .unwrap();
-
-        display.flush().unwrap();
-        Timer::after_millis(10).await;
+    for addr in 1..=127 {
+        if i2c.read(addr, &mut [0]).await.is_ok() {
+            addresses.push(addr);
+        }
     }
+
+    addresses
+        .into_iter()
+        .map(|addr| format!("{addr:#x}"))
+        .collect()
 }
+
+// #[embassy_executor::task]
+// async fn ui_task(mut display: Display) {
+//     display
+//         .init_with_addr_mode(ssd1306::command::AddrMode::Horizontal)
+//         .unwrap();
+//     display.clear_buffer();
+//     display.set_display_on(true).unwrap();
+//     loop {
+//         display.clear_buffer();
+//         let pos = critical_section::with(|cs| POSITION.borrow(cs).get());
+//         embedded_graphics::text::Text::new(
+//             &format!("POS: {}", pos),
+//             Point::new(0, 0),
+//             MonoTextStyleBuilder::new()
+//                 .text_color(BinaryColor::On)
+//                 .font(&ascii::FONT_5X8)
+//                 .build(),
+//         )
+//         .draw(&mut display)
+//         .unwrap();
+//         display.flush().unwrap();
+//         Timer::after_millis(10).await;
+//     }
+// }
 
 #[embassy_executor::task]
 async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
@@ -114,6 +149,9 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
     let now = || time::Instant::now().duration_since_epoch().as_millis();
     let mut ble = Ble::new(connector, now);
     println!("Connector created");
+
+    let position_snd = POSITION.sender();
+    let mut position_rcv = POSITION.receiver().unwrap();
 
     loop {
         println!("{:?}", ble.init().await);
@@ -141,15 +179,12 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
         let mut wf = |offset: usize, data: &[u8]| {
             println!("RECEIVED: {} {:?}", offset, data);
         };
-
         let mut wf2 = |offset: usize, data: &[u8]| {
             println!("RECEIVED: {} {:?}", offset, data);
         };
-
         let mut rf3 = |_offset: usize, data: &mut [u8]| {
-            critical_section::with(|cs| {
-                data[0..4].copy_from_slice(&POSITION.borrow(cs).get().to_be_bytes());
-            });
+            // FIXME: Idk how but I need async attributes in bleps
+            data[0..4].copy_from_slice(&position_rcv.try_changed().unwrap_or(0).to_be_bytes());
             4
         };
 
@@ -157,7 +192,7 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
             if offset == 0 && data.len() == 4 {
                 let new_pos = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 println!("Set position to {new_pos} ({data:?})");
-                critical_section::with(|cs| POSITION.borrow(cs).set(new_pos));
+                position_snd.send(new_pos);
             } else {
                 println!("Got wrong format for position write: offset={offset}, data={data:?}");
             }
@@ -203,6 +238,32 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
     }
 }
 
+#[embassy_executor::task]
+async fn imu_task(mut imu: Gy87<I2c<'static, Async>>) {
+    loop {
+        // println!(
+        //     "IMU: temp: {}, accel: {}, gyro: {}, mag: {}",
+        //     imu.get_imu_temp().await.unwrap(),
+        //     imu.get_acc().await.unwrap(),
+        //     imu.get_gyro().await.unwrap(),
+        //     imu.read_mag().await.unwrap()
+        // );
+        println!("{}", imu.read_mag().await.unwrap());
+        Timer::after_millis(1000).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn stepper_task(mut stepper: Stepper<A4988<Output<'static>, Output<'static>, NoPin>>) {
+    let mut position_rcv = POSITION.receiver().unwrap();
+    loop {
+        println!("Waiting for new position...");
+        let position = position_rcv.changed().await;
+        println!("Move stepper to {position}");
+        stepper.move_to(position).await.unwrap();
+    }
+}
+
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
@@ -222,31 +283,7 @@ async fn main(spawner: Spawner) -> ! {
         init(timg0.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
     );
 
-    let mut motor = ULN2003::new(
-        Output::new(
-            peripherals.GPIO0,
-            esp_hal::gpio::Level::Low,
-            OutputConfig::default(),
-        ),
-        Output::new(
-            peripherals.GPIO1,
-            esp_hal::gpio::Level::Low,
-            OutputConfig::default(),
-        ),
-        Output::new(
-            peripherals.GPIO2,
-            esp_hal::gpio::Level::Low,
-            OutputConfig::default(),
-        ),
-        Output::new(
-            peripherals.GPIO3,
-            esp_hal::gpio::Level::Low,
-            OutputConfig::default(),
-        ),
-        Some(embassy_time::Delay),
-    );
-
-    let display_i2c = I2c::new(
+    let i2c = I2c::new(
         peripherals.I2C0,
         esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
     )
@@ -255,19 +292,76 @@ async fn main(spawner: Spawner) -> ! {
     .with_scl(peripherals.GPIO21)
     .with_sda(peripherals.GPIO20);
 
-    let di = I2CDisplayInterface::new(display_i2c);
+    // let i2c_bus = shared_bus::new_
 
-    let display = ssd1306::Ssd1306::new(
-        di,
-        ssd1306::size::DisplaySize128x64,
-        ssd1306::rotation::DisplayRotation::Rotate0,
-    )
-    .into_buffered_graphics_mode();
+    // let as5600 = As5600::new(bus)
+
+    let a4988 = A4988::new(
+        Output::new(
+            peripherals.GPIO1,
+            esp_hal::gpio::Level::Low,
+            OutputConfig::default(),
+        ),
+        Output::new(
+            peripherals.GPIO0,
+            esp_hal::gpio::Level::Low,
+            OutputConfig::default(),
+        ),
+        NoPin,
+    );
+
+    let mut stepper = Stepper::new(
+        a4988,
+        StepperConfig {
+            steps_per_rev: 200,
+            acceleration: 100.0,
+            step_div: stepper::StepDiv::Div16,
+            speed_rpm: 50.0,
+        },
+    );
+
+    let mut imu = Gy87::new(i2c);
+
+    match imu.init(&mut embassy_time::Delay).await {
+        Ok(_) => {}
+        Err(err) => match err {
+            gy87::Error::I2c(err) => {
+                println!(
+                    "Available I2C devices: {}",
+                    (1..=127)
+                        .filter(|addr| imu.i2c().read(*addr, &mut [0]).is_ok())
+                        .fold(String::new(), |list, addr| format!("{list} {addr:#x}"))
+                );
+                panic!("IMU init I2C error: {err:?}");
+            }
+            _ => panic!("IMU init error: {err:?}"),
+        },
+    }
+
+    (1..=127).for_each(|addr| {
+        if let Ok(_) = imu.i2c().read(addr, &mut [0]) {
+            println!("Found I2C device at address {addr:#x}");
+        }
+    });
+
+    // let di = I2CDisplayInterface::new(i2c);
+
+    // let display = ssd1306::Ssd1306::new(
+    //     di,
+    //     ssd1306::size::DisplaySize128x64,
+    //     ssd1306::rotation::DisplayRotation::Rotate0,
+    // )
+    // .into_buffered_graphics_mode();
 
     spawner.must_spawn(ble_task(esp_wifi_ctrl, peripherals.BT));
-    spawner.must_spawn(ui_task(display));
+    // spawner.must_spawn(imu_task(imu));
+    // spawner.must_spawn(ui_task(display));
+    // spawner.must_spawn(stepper_task(stepper));
 
     loop {
-        Timer::after_secs(100).await;
+        stepper.move_to(1000).await.unwrap();
+        Timer::after_millis(100).await;
+        stepper.move_to(0).await.unwrap();
+        Timer::after_millis(100).await;
     }
 }

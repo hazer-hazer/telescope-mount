@@ -5,66 +5,406 @@
     <title>Telescope controls</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="icon" type="image/png" href="">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Iceland&display=swap" rel="stylesheet">
+    <style>
+        /* https://coolors.co/d81159-8f2d56-218380-9ae19d-fbb13c */
+
+        /* 1. Use a more-intuitive box-sizing model */
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+        }
+
+        /* 2. Remove default margin */
+        * {
+            margin: 0;
+        }
+
+        /* 3. Enable keyword animations */
+        @media (prefers-reduced-motion: no-preference) {
+            html {
+                interpolate-size: allow-keywords;
+            }
+        }
+
+        body,
+        html {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            /* 4. Add accessible line-height */
+            line-height: 1.5;
+            /* 5. Improve text rendering */
+            -webkit-font-smoothing: antialiased;
+        }
+
+        img,
+        picture,
+        video,
+        canvas,
+        svg {
+            display: block;
+            max-width: 100%;
+        }
+
+        input,
+        button,
+        textarea,
+        select {
+            font: inherit;
+        }
+
+        p,
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6 {
+            overflow-wrap: break-word;
+        }
+
+        p {
+            text-wrap: pretty;
+        }
+
+        h1,
+        h2,
+        h3,
+        h4,
+        h5,
+        h6 {
+            text-wrap: balance;
+        }
+
+        #root,
+        #__next {
+            isolation: isolate;
+        }
+
+        body {
+            display: block;
+            width: 100%;
+            height: 100%;
+
+            font-family: "Iceland", sans-serif;
+            font-weight: 400;
+            font-style: normal;
+        }
+
+        .btn {
+            display: block;
+            width: max-content;
+            height: max-content;
+            margin: auto;
+            padding: 10px 25px;
+            text-align: center;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px #ccc;
+            transition: .25s ease-in-out;
+            cursor: pointer;
+            font-size: 30px;
+            user-select: none;
+        }
+
+        .btn:hover {
+            background-color: #f0f0f0;
+        }
+
+        .btn:active {
+            translate: 0 5px;
+            box-shadow: 0 0 0 #000;
+        }
+
+        .screen {
+            display: grid;
+            width: min(100vw, 1000px);
+            height: 100%;
+            grid-template-rows: 1fr;
+            grid-template-columns: 1fr;
+            align-items: center;
+            justify-items: center;
+            margin: 0 auto;
+        }
+
+        #controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            grid-template-rows: 1fr 1fr 1fr;
+            grid-template-areas:
+                ". up ."
+                "left pos right"
+                ". down .";
+            align-items: center;
+            justify-items: center;
+        }
+
+        #btn-plus {
+            grid-area: up;
+        }
+
+        #btn-minus {
+            grid-area: down;
+        }
+
+        #position {
+            grid-area: pos;
+            font-size: 40px;
+            color: #D81159;
+            transition: 0.5s ease-in-out;
+        }
+
+        #position[data-status="synced"] {
+            color: #9AE19D;
+        }
+
+        #status {
+            display: block;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            margin: auto;
+            width: 100vw;
+            height: max-content;
+            border-radius: 10px 10px 0 0;
+            font-size: 20px;
+            box-shadow: 0 0 3px 1px #ddd;
+            text-align: center;
+            width: min(100vw, 1000px);
+            color: #111;
+            transition: 0.5s ease-in-out;
+        }
+
+        #status.error {
+            color: #D81159;
+        }
+
+        #status.success {
+            color: #9AE19D;
+        }
+    </style>
 </head>
 
 <body>
-    <div class="main">
-        <div id="message"></div>
-        <div class="screen scan-screen">
-            <div class="btn" id="scan-btn">Scan</div>
+    <!-- <div id="message"></div> -->
+    <div class="screen connect-screen">
+        <div class="btn" id="connect-btn">Connect</div>
+    </div>
 
-            <div id="scan-list"></div>
+    <div class="screen control-screen">
+        <div id="controls">
+            <div class="btn" id="btn-plus">
+                +1
+            </div>
+            <div class="label" id="position"></div>
+            <div class="btn" id="btn-minus">
+                -1
+            </div>
         </div>
     </div>
+
+    <div id="status"></div>
 </body>
 
 <script>
-    const makeBtn = (text, classes, onClick) => {
-        const btn = document.createElement('div')
-        btn.addEventListener('click', onClick)
-        btn.classList.add('btn', ...classes)
-        btn
+    const status = document.querySelector('#status');
+
+    const setStatus = (text, kind = null) => {
+        status.innerHTML = text;
+
+        status.classList.remove('error', 'success');
+
+        if (kind) {
+            status.classList.add(kind);
+        }
     }
 
-    const message = document.querySelector('#message')
+    const allScreens = document.querySelectorAll('.screen')
+    const navigate = (screen) => {
+        allScreens.forEach(screen => screen.style.display = 'none')
+        const screenEl = document.querySelector(`.${screen}-screen.screen`)
+        if (!screenEl) {
+            console.error(`Screen '${screen}' not found`)
+            return
+        }
+        setTimeout(() => {
+            screenEl.style.display = 'grid'
+        }, 100);
+    }
 
-    const showMessage = (text) => {
-        message.innerHTML = message
-        message.style.visibility = 'visible'
-    }
-    const hideMessage = () => {
-        message.style.visibility = 'hidden'
-    }
+    setStatus('Waiting for connection...')
+    navigate('connect')
 
     // Connection screen //
-    const scanBtn = document.querySelector('#scan-btn')
-    const scanList = document.querySelector('#scan-list')
+    const connectBtn = document.querySelector('#connect-btn')
+    let gatt = null
 
-    scanBtn.addEventListener('click', async () => {
+    const connectDevice = async (device) => {
+        console.log('Connect to device', device)
+        setStatus('Connecting...');
+        try {
+            await device.gatt.connect()
+        } catch (err) {
+            console.error(err);
+            setStatus(`Error: ${err.message}. Reconnect manually`, 'error')
+            navigate('connect')
+            return
+        }
+        gatt = device.gatt;
+
+        localStorage.setItem('device-id', device.id);
+
+        device.addEventListener('gattserverdisconnected', onDisconnected)
+
+        await onConnected()
+
+        setStatus(`Connected to: ${device.name}`, 'success');
+    }
+
+    connectBtn.addEventListener('click', async () => {
         if (!navigator.bluetooth || !await navigator.bluetooth.getAvailability()) {
             // showMessage('Bluetooth is unavailable')
             alert('Bluetooth is not available on this device')
             return
         }
 
-        try {
-            const btPermission = await navigator.permissions.query({ name: "bluetooth" });
-            if (btPermission.state === "denied") {
-                alert('This app does not work without bluetooth, please allow it in your browser')
-                return
-            }
-        } catch (err) {
-            console.error(err)
-            alert('An error occurred trying to enable bluetooth, please ensure you turned on bluetooth feature in your browser. Windows is not supported though. (in chrome it\'s inside chrome://flags/)')
-            return;
+        if (!navigator.bluetooth.getDevices) {
+            alert('Enable chrome://flags/#enable-experimental-web-platform-features');
+            return
         }
 
-        console.log('scan', navigator.bluetooth);
+        const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: ['937312e0-2354-11eb-9f10-fbc30a62cf38'] });
 
-        const devices = await navigator.bluetooth.getDevices();
+        try {
+            await connectDevice(device)
+        } catch (err) {
+            console.error('err:', err)
+            alert('Failed to connect to device')
+            navigate('connect')
+            return
+        }
 
-        console.log('devices:', devices)
+        navigate('control');
     });
+
+    // Reconnect to previously connected device automatically
+    document.addEventListener('DOMContentLoaded', async () => {
+        if ('permissions' in navigator && 'bluetooth' in navigator) {
+            try {
+                const devices = await navigator.bluetooth.getDevices();
+                const prevDevice = devices.filter(device => device.id === localStorage.getItem('device-id'))[0];
+                if (prevDevice) {
+                    await connectDevice(prevDevice)
+                }
+            } catch (error) {
+                console.log('Error during getDevices:', error);
+                setStatus(`Error: ${error}`, 'error');
+            }
+        }
+    });
+
+    // Control screen //
+    const SYNC_INTERVAL = 10_000;
+    const positionLabel = document.querySelector('#position')
+    const upBtn = document.querySelector('#btn-plus')
+    const downBtn = document.querySelector('#btn-minus')
+    let position = 0;
+    let positionInSync = false;
+
+    upBtn.addEventListener('click', () => {
+        setLocalPosition(position + 1)
+    })
+    downBtn.addEventListener('click', () => {
+        setLocalPosition(position - 1)
+    })
+
+    const showPosition = () => {
+        positionLabel.innerHTML = position > 0 ? `+${position}` : `${position}`
+    }
+    const setGlobalPosition = () => {
+        positionInSync = true;
+        positionLabel.dataset['status'] = 'synced'
+        showPosition()
+    }
+
+    const positionChar = async () => {
+        const service = await gatt.getPrimaryService('937312e0-2354-11eb-9f10-fbc30a62cf38')
+        const positionChar = await service.getCharacteristic('987312e0-2354-11eb-9f10-fbc30a62cf38')
+        return positionChar
+    }
+
+    const readPosition = async () => {
+        const char = await positionChar();
+        const devicePositionRaw = await char.readValue();
+        const devicePosition = devicePositionRaw.getInt32(0)
+        return devicePosition
+    }
+
+    const syncPosition = async () => {
+        if (setPositionTimeout) {
+            console.log('Skip sync due to debounce')
+            return
+        }
+        const devicePosition = await readPosition()
+        console.log('Sync position:', devicePosition)
+        setGlobalPosition(devicePosition)
+    }
+
+    const SET_POSITION_DEBOUNCE_MS = 500
+    let setPositionTimeout = null
+    const setLocalPosition = async (newPos) => {
+        clearTimeout(setPositionTimeout);
+
+        position = newPos;
+        positionLabel.dataset['status'] = 'unsync'
+        showPosition()
+
+        setPositionTimeout = setTimeout(async () => {
+            await sendPosition(newPos)
+            setPositionTimeout = null
+        }, SET_POSITION_DEBOUNCE_MS);
+    }
+
+    const sendPosition = async () => {
+        if (!gatt) {
+            throw new Error('Device disconnected')
+        }
+
+        const devicePosition = await readPosition();
+
+        // if (position !== devicePosition) {
+        //     console.warn('Position is not in sync, set real')
+        //     savePosition(devicePosition)
+        // } else {
+        const newPosBuf = new ArrayBuffer(4);
+        new DataView(newPosBuf).setInt32(0, position, false);
+        console.log('Sending new position:', position, newPosBuf)
+        const char = await positionChar();
+        await char.writeValueWithoutResponse(newPosBuf)
+        setGlobalPosition()
+        // }
+    }
+
+    let syncInterval = null
+    async function onConnected() {
+        await syncPosition()
+        syncInterval = setInterval(async () => {
+            await syncPosition()
+        }, SYNC_INTERVAL);
+    }
+
+    function onDisconnected() {
+        setStatus('Disconnected', 'error')
+        clearInterval(syncInterval)
+    }
 </script>
 
 </html>

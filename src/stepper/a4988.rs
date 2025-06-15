@@ -45,6 +45,7 @@ where
             .map_err(|_| A4988Error::PinError)
     }
 
+
     async fn step(&mut self) -> Result<(), Self::Error> {
         // Create a step pulse (minimum 1µs high time according to A4988 datasheet)
         self.step_pin.set_high().map_err(|_| A4988Error::PinError)?;

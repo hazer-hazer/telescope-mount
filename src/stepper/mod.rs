@@ -46,14 +46,18 @@ pub trait StepperDriver {
 
 pub struct StepperConfig {
     pub steps_per_rev: u32,
-    pub speed_rpm: f32,    // steps per second
-    pub acceleration: f32, // steps per second squared
+    pub max_speed_rpm: f32, // steps per second
+    pub acceleration: f32,  // steps per second squared
     pub step_div: StepDiv,
 }
 
 impl StepperConfig {
-    fn min_interval(&self) -> f32 {
-        0.676 * SQRT_2 / self.config.acceleration.sqrt()
+    fn min_interval(&self) -> u64 {
+        (0.676 * (2.0 / self.acceleration).sqrt() * 1_000_000.0) as u64
+    }
+
+    fn max_interval(&self) -> u64 {
+        (1_000_000.0 / (self.max_speed_rpm * self.steps_per_rev as f32 / 60.0)) as u64
     }
 }
 
@@ -72,21 +76,30 @@ impl<D: StepperDriver> Debug for StepperError<D> {
 pub struct Stepper<D: StepperDriver> {
     position: i32,
     target: i32,
+    speed: f32,
     // Current velocity in steps per second
-    current_interval: f32,
+    step_interval_us: u64,
     driver: D,
+    dir_cw: bool,
+    // Local step counter for current target
+    local_step: i32,
     config: StepperConfig,
 }
 
 impl<D: StepperDriver> Stepper<D> {
     pub fn new(driver: D, config: StepperConfig) -> Self {
-        Self {
+        let this = Self {
             position: 0,
             target: 0,
-            current_interval: MIN_VELOCITY,
+            step_interval_us: 0,
+            dir_cw: false,
+            local_step: 0,
+            speed: 0.0,
             driver,
             config,
-        }
+        };
+
+        this
     }
 
     pub async fn move_to(&mut self, position: i32) -> Result<(), StepperError<D>> {
@@ -100,58 +113,22 @@ impl<D: StepperDriver> Stepper<D> {
     }
 
     async fn run(&mut self) -> Result<(), StepperError<D>> {
-        let steps_to_move = self.target - self.position;
-        if steps_to_move == 0 {
-            return Ok(());
-        }
-
-        let direction = steps_to_move > 0;
-        let steps_to_move = steps_to_move.abs() as u32 * self.config.step_div as u32;
-        let midpoint = steps_to_move as f32 / 2.0;
-
-        self.driver
-            .set_direction(direction)
-            .await
-            .map_err(|err| StepperError::Driver(err))?;
         self.driver
             .set_enabled(true)
             .await
             .map_err(|err| StepperError::Driver(err))?;
 
-        // Calculate acceleration parameters
-        let acceleration = self.config.acceleration;
-        let max_velocity = self.config.speed_rpm
-            * self.config.steps_per_rev as f32
-            * self.config.step_div as u32 as f32
-            / 60.0;
-        let acceleration_steps = (max_velocity * max_velocity) / (2.0 * acceleration);
-        let acceleration_steps = acceleration_steps.min(midpoint);
-        let deceleration_steps = acceleration_steps;
-
-        let coasting_steps = if steps_to_move > (acceleration_steps + deceleration_steps) as u32 {
-            steps_to_move - (acceleration_steps + deceleration_steps) as u32
-        } else {
-            // Triangular profile (no coasting)
-            0
-        };
-
-        assert!((acceleration_steps + deceleration_steps) as u32 <= steps_to_move);
-
-        // Acceleration phase
-        self.accelerate(1_000_000.0 / max_velocity, acceleration_steps as u32)
-            .await?;
-
-        // Coasting phase (constant speed)
-        if coasting_steps > 0 {
-            self.run_at_constant_speed(coasting_steps).await?;
+        while self.step().await {
+            self.driver
+                .set_direction(self.dir_cw)
+                .await
+                .map_err(|err| StepperError::Driver(err))?;
+            self.driver
+                .step()
+                .await
+                .map_err(|err| StepperError::Driver(err))?;
         }
 
-        // Deceleration phase
-        self.decelerate(deceleration_steps as u32).await?;
-
-        // Update current position
-        self.position = self.target;
-        self.current_interval = self.config.min_interval();
         self.driver
             .set_enabled(false)
             .await
@@ -160,77 +137,48 @@ impl<D: StepperDriver> Stepper<D> {
         Ok(())
     }
 
-    /// Acceleration phase
-    async fn accelerate(&mut self, max_interval: f32, steps: u32) -> Result<(), StepperError<D>> {
-        let mut delay = 0.676 * SQRT_2 * 1_000_000.0 / self.config.acceleration;
-        let delay0 = delay;
+    async fn step(&mut self) -> bool {
+        let dist = self.target - self.position;
+        let steps_to_stop = (self.speed.powi(2) / (2.0 * self.config.acceleration)) as i32;
 
-        for step in 0..steps {
-            Timer::after(Duration::from_micros(delay as u64)).await;
-
-            self.driver
-                .step()
-                .await
-                .map_err(|err| StepperError::Driver(err))?;
-            self.position += if self.target > self.position { 1 } else { -1 };
-
-            delay = delay0 - 2.0 * delay0 / (4.0 * step as f32 + 1.0).min(max_interval);
-            self.current_interval = delay;
+        if dist == 0 && steps_to_stop <= 1 {
+            self.step_interval_us = 0;
+            self.speed = 0.0;
+            self.local_step = 0;
+            return false;
         }
 
-        Ok(())
-    }
-
-    /// Run at constant speed
-    async fn run_at_constant_speed(&mut self, steps: u32) -> Result<(), StepperError<D>> {
-        // TODO: Or use max speed?
-        let delay = Duration::from_micros(self.current_interval as u64);
-
-        for _ in 0..steps {
-            Timer::after(delay).await;
-            self.driver
-                .step()
-                .await
-                .map_err(|err| StepperError::Driver(err))?;
-            self.position += if self.target > self.position { 1 } else { -1 };
+        if dist > 0 {
+            if self.local_step > 0 && (steps_to_stop >= dist || !self.dir_cw) {
+                self.local_step = -(steps_to_stop as i32);
+            } else if self.local_step < 0 && steps_to_stop < dist && self.dir_cw {
+                self.local_step = -self.local_step;
+            }
+        } else if dist < 0 {
+            if self.local_step > 0 && (steps_to_stop >= -dist || self.dir_cw) {
+                self.local_step = -steps_to_stop;
+            } else if self.local_step < 0 && steps_to_stop < -dist && !self.dir_cw {
+                self.local_step = -self.local_step;
+            }
         }
 
-        Ok(())
-    }
-
-    /// Deceleration phase
-    async fn decelerate(&mut self, steps: u32) -> Result<(), StepperError<D>> {
-        let mut delay = self.current_interval;
-        let min_interval = self.config.min_interval();
-
-        for step in 0..steps {
-            Timer::after(Duration::from_micros(delay as u64)).await;
-
-            self.driver
-                .step()
-                .await
-                .map_err(|err| StepperError::Driver(err))?;
-            self.position += if self.target > self.position { 1 } else { -1 };
-
-            let decel_step =
-                delay = delay0 - 2.0 * delay0 / (4.0 * step as f32 + 1.0).max(min_interval);
-            self.current_interval = delay;
-        }
-
-        Ok(())
-    }
-
-    /// Calculate delay between steps based on current speed
-    fn calculate_step_delay(&self, velocity: f32) -> Result<Duration, StepperError<D>> {
-        assert!(velocity >= 0.0);
-
-        if velocity == 0.0 {
-            panic!("Velocity is zero")
-            // Duration::from_micros(u64::MAX)
-            // Ok(Duration::from_micros(0))
+        self.step_interval_us = if self.local_step == 0 {
+            self.dir_cw = dist > 0;
+            self.config.min_interval()
         } else {
-            Ok(Duration::from_micros((1_000_000.0 / velocity) as u64))
-        }
+            let step_interval = self.step_interval_us as f32;
+            ((step_interval - 2.0 * step_interval / (4.0 * self.local_step as f32) + 1.0) as u64)
+                .max(self.config.max_interval())
+        };
+
+        self.local_step += 1;
+        self.speed =
+            1_000_000.0 / self.step_interval_us as f32 * if self.dir_cw { 1.0 } else { -1.0 };
+        self.position += if self.dir_cw { 1 } else { -1 };
+
+        Timer::after(Duration::from_micros(self.step_interval_us)).await;
+
+        true
     }
 
     /// Get current position

@@ -314,9 +314,9 @@ async fn main(spawner: Spawner) -> ! {
         a4988,
         StepperConfig {
             steps_per_rev: 200,
-            acceleration: 100.0,
+            acceleration: 500.0,
             step_div: stepper::StepDiv::Div16,
-            speed_rpm: 50.0,
+            max_speed_rpm: 400.0,
         },
     );
 
@@ -359,9 +359,7 @@ async fn main(spawner: Spawner) -> ! {
     // spawner.must_spawn(stepper_task(stepper));
 
     loop {
-        stepper.move_to(1000).await.unwrap();
-        Timer::after_millis(100).await;
+        stepper.move_to(3200).await.unwrap();
         stepper.move_to(0).await.unwrap();
-        Timer::after_millis(100).await;
     }
 }

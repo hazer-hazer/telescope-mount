@@ -1,15 +1,19 @@
-use crate::{gy87::hmc5883::*, list_i2c_devices};
+use crate::{gy87::qmc5883p::*, list_i2c_devices};
 use bits::*;
 use core::ops::Neg;
+use embassy_time::{with_timeout, Duration, Timer};
 use embedded_hal_async::{delay::DelayNs, i2c::I2c};
 use esp_println::println;
 use micromath::F32Ext;
 use mpu6050::*;
 use nalgebra::Vector3;
+use num_traits::FromPrimitive;
 
 mod bits;
-mod hmc5883;
-mod mpu6050;
+pub mod kalman;
+pub mod madgwick;
+pub mod mpu6050;
+mod qmc5883p;
 
 /// PI, f32
 pub const PI: f32 = core::f32::consts::PI;
@@ -17,13 +21,16 @@ pub const PI: f32 = core::f32::consts::PI;
 /// PI / 180, for conversion to radians
 pub const PI_180: f32 = PI / 180.0;
 
-const Q16: f32 = 32768.0;
+const Q15: f32 = 32768.0;
 
 /// All possible errors in this crate
 #[derive(Debug)]
 pub enum Error<E> {
     I2c(E),
     Mpu6050InvalidChipId(u8),
+    MagWrongId(u8),
+    Timeout,
+    Conversion,
 }
 
 /// Handles all operations on/with Mpu6050
@@ -50,7 +57,7 @@ where
             accel_sens: AccelRange::G2.sensitivity(),
             gyro_sens: GyroRange::D250.sensitivity(),
             addr: DEFAULT_MPU6050_ADDR,
-            mag_addr: DEFAULT_HMC5883L_ADDR,
+            mag_addr: DEFAULT_QMC5883P_ADDR,
         }
     }
 
@@ -75,11 +82,11 @@ where
     }
 
     /// Wakes MPU6050 with all sensors enabled (default)
-    async fn wake<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
+    async fn wake(&mut self) -> Result<(), Error<E>> {
         // MPU6050 has sleep enabled by default -> set bit 0 to wake
         // Set clock source to be PLL with x-axis gyroscope reference, bits 2:0 = 001 (See Register Map )
         self.write_byte(PWR_MGMT_1::ADDR, 0x01).await?;
-        delay.delay_ms(100u32).await;
+        Timer::after_millis(100).await;
         Ok(())
     }
 
@@ -94,94 +101,176 @@ where
     /// The clock source can be selected according to the following table...."
     pub async fn set_clock_source(&mut self, source: CLKSEL) -> Result<(), Error<E>> {
         Ok(self
-            .write_bits(
-                PWR_MGMT_1::ADDR,
-                PWR_MGMT_1::CLKSEL.bit,
-                PWR_MGMT_1::CLKSEL.length,
-                source as u8,
-            )
+            .write_bits(PWR_MGMT_1::ADDR, PWR_MGMT_1::CLKSEL, source as u8)
             .await?)
     }
 
     /// get current clock source
     pub async fn get_clock_source(&mut self) -> Result<CLKSEL, Error<E>> {
-        let source = self
-            .read_bits(
-                PWR_MGMT_1::ADDR,
-                PWR_MGMT_1::CLKSEL.bit,
-                PWR_MGMT_1::CLKSEL.length,
-            )
-            .await?;
+        let source = self.read_bits(PWR_MGMT_1::ADDR, PWR_MGMT_1::CLKSEL).await?;
         Ok(CLKSEL::from(source))
     }
 
     /// Init wakes MPU6050 and verifies register addr, e.g. in i2c
-    pub async fn init<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
-        self.wake(delay).await?;
+    pub async fn init(&mut self) -> Result<(), Error<E>> {
+        self.wake().await?;
         self.verify().await?;
         self.set_accel_range(AccelRange::G2).await?;
         self.set_gyro_range(GyroRange::D250).await?;
         self.set_accel_hpf(ACCEL_HPF::_RESET).await?;
 
-        self.init_hmc5883(delay).await
+        self.init_mag().await
     }
 
-    async fn init_hmc5883<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<E>> {
-        // self.write_byte(0x6A, 0x20).await?;
-        // self.write_byte(0x24, 0x0D).await?;
-        // self.write_byte(0x25, self.hmc5883_addr << 1 | 0x01).await?;
-        // self.write_byte(0x26, 0x00).await?;
-        // self.write_byte(0x27, 0x86).await?;
+    async fn init_mag(&mut self) -> Result<(), Error<E>> {
+        // Set i2c master mode off mpu6050
+        self.write_bit(INT_ENABLE::ADDR, INT_ENABLE::I2C_MST_INT_EN, false)
+            .await?;
+        // set i2c bypass mode on mpu6050
+        self.write_bit(INT_PIN_CFG::ADDR, INT_PIN_CFG::I2C_BYPASS_EN, true)
+            .await?;
+        self.write_bit(0x6A, 5, false).await?;
+        Timer::after_millis(500).await;
+        // wake
 
-        // println!(
-        //     "i2c devices: {}",
-        //     list_i2c_devices(&mut self.i2c).await.join(", ")
-        // );
+        let id = self.read_byte_mag(qmc5883p::reg::CHIP_ID_REG).await?;
 
-        // // Reset
-        // self.write_byte(0x2c, 0x0B, 0x01).await?;
-        // delay.delay_ms(100).await;
-        // self.write_byte(0x2c, 0x09, 0x1D).await?;
-        // // Disable interrupt
-        // self.write_byte(0x2c, 0x0A, 0x00).await?;
+        if id != qmc5883p::reg::CHIP_ID_EXPECTED {
+            return Err(Error::MagWrongId(id));
+        }
 
-        // println!("qmc id: {:#x}", self.read_byte(0x2c, 0x0D).await?);
+        self.write_bit_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SOFT_RESET,
+            true,
+        )
+        .await?;
+        Timer::after_millis(100).await;
 
-        // self.write_bit(USER_CTRL, 5, true).await?;
-
-        // let id = self.read_byte(self.hmc5883_addr, 0x0D).await?;
-
-        // println!("HMC id: {id}");
-
-        // let mut id = [0; 3];
-        // self.read_bytes(self.hmc5883_addr, *REG_ID.start(), &mut id)
-        //     .await?;
-
-        // if id != [0x48, 0x34, 0x33] {
-        //     return Err(Error::Hmc5883InvalidChipId(id));
-        // }
-
-        self.write_byte(0x6B, 0x00).await?;
-        // Enable MPU6050's I²C master mode
-        self.write_byte(0x6A, 0x20).await?; // USER_CTRL: BIT_I2C_MST_EN
-        self.write_byte(0x24, 0x0D).await?; // I2C_MST_CTRL: 400kHz
-
-        // Configure QMC5883L via MPU6050's slave interface
-        self.write_byte_mag(0x0B, 0x01).await?; // QMC5883L reset (SET_RESET)
-        delay.delay_ms(100).await;
-        self.write_byte_mag(0x09, 0b1_00_11_011).await?; // CONFIG_1: OSR=512, ±8G, 200Hz
-        delay.delay_ms(100).await;
-        self.write_byte_mag(0x0A, 0x00).await?; // CONFIG_2: Disable interrupt
-        delay.delay_ms(100).await;
-
-        // Set slave addr
-        self.write_byte(0x25, 0x1 << 7 & self.mag_addr).await?;
-        // Start at DATA_X_L
-        self.write_byte(0x26, 0x00).await?;
-        // Enable hmc slave and set read bytes to 6
-        self.write_byte(0x27, 0b1000_0110).await?;
+        // self.write_byte_mag(qmc5883p::reg::Control1::ADDR, 0b1100_1111).await?;
+        self.write_byte_mag(0x29, 0x06).await?;
+        self.set_mag_mode(qmc5883p::Mode::Continuous).await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control1::ADDR,
+            qmc5883p::reg::Control1::OUTPUT_DATA_RATE,
+            qmc5883p::OutputDataRate::Rate200HZ as u8,
+        )
+        .await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control1::ADDR,
+            qmc5883p::reg::Control1::OVER_SAMPLING,
+            qmc5883p::OverSampling::OverSampling8 as u8,
+        )
+        .await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control1::ADDR,
+            qmc5883p::reg::Control1::DOWN_SAMPLING,
+            qmc5883p::DownSampling::DownSampling8 as u8,
+        )
+        .await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::RANGE,
+            qmc5883p::Range::Gauss30 as u8,
+        )
+        .await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SET_RESET_MODE,
+            qmc5883p::SetResetMode::SetResetOn as u8,
+        )
+        .await?;
+        self.write_bits_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SET_RESET_MODE,
+            qmc5883p::SetResetMode::SetResetOn as u8,
+        )
+        .await?;
+        self.write_bit_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SELF_TEST,
+            false,
+        )
+        .await?;
+        self.write_bit_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SOFT_RESET,
+            false,
+        )
+        .await?;
 
         Ok(())
+    }
+
+    async fn set_mag_mode(&mut self, mode: qmc5883p::Mode) -> Result<(), Error<E>> {
+        self.write_bits_mag(
+            qmc5883p::reg::Control1::ADDR,
+            qmc5883p::reg::Control1::MODE,
+            mode as u8,
+        )
+        .await
+    }
+
+    // async fn get_mag_mode(&mut self) -> Result<qmc5883p::Mode, Error<E>> {
+    //     self.read_bits(qmc5883p::reg::Control1::ADDR, qmc5883p::reg::Control1::MODE)
+    //         .await
+    //         .map(|mode| mode.try_into().map_err(|_| Error::Conversion))
+    // }
+
+    async fn wait_mag_data_ready(&mut self) -> Result<(), Error<E>> {
+        loop {
+            if self
+                .read_bit_mag(
+                    qmc5883p::reg::Status::ADDR,
+                    qmc5883p::reg::Status::DATA_READY as u8,
+                )
+                .await?
+                == 1
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    pub async fn mag_self_test(&mut self) -> Result<Vector3<i16>, Error<E>> {
+        self.set_mag_mode(qmc5883p::Mode::Continuous).await?;
+
+        with_timeout(Duration::from_millis(1_000), self.wait_mag_data_ready())
+            .await
+            .map_err(|_| Error::Timeout)??;
+
+        let init = self.read_mag_raw().await?;
+
+        let prev_mode = self
+            .read_bits_mag(qmc5883p::reg::Control1::ADDR, qmc5883p::reg::Control1::MODE)
+            .await?;
+
+        self.write_bit_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SELF_TEST,
+            true,
+        )
+        .await?;
+
+        Timer::after_millis(150).await;
+
+        self.write_bit_mag(
+            qmc5883p::reg::Control2::ADDR,
+            qmc5883p::reg::Control2::SELF_TEST,
+            false,
+        )
+        .await?;
+
+        let self_test = self.read_mag_raw().await?;
+
+        self.write_bits_mag(
+            qmc5883p::reg::Control1::ADDR,
+            qmc5883p::reg::Control1::MODE,
+            prev_mode,
+        )
+        .await?;
+
+        Ok(init - self_test)
     }
 
     /// Verifies device to address 0x68 with WHOAMI.addr() Register
@@ -217,23 +306,14 @@ where
     /// set accel high pass filter mode
     pub async fn set_accel_hpf(&mut self, mode: ACCEL_HPF) -> Result<(), Error<E>> {
         Ok(self
-            .write_bits(
-                ACCEL_CONFIG::ADDR,
-                ACCEL_CONFIG::ACCEL_HPF.bit,
-                ACCEL_CONFIG::ACCEL_HPF.length,
-                mode as u8,
-            )
+            .write_bits(ACCEL_CONFIG::ADDR, ACCEL_CONFIG::ACCEL_HPF, mode as u8)
             .await?)
     }
 
     /// get accel high pass filter mode
     pub async fn get_accel_hpf(&mut self) -> Result<ACCEL_HPF, Error<E>> {
         let mode: u8 = self
-            .read_bits(
-                ACCEL_CONFIG::ADDR,
-                ACCEL_CONFIG::ACCEL_HPF.bit,
-                ACCEL_CONFIG::ACCEL_HPF.length,
-            )
+            .read_bits(ACCEL_CONFIG::ADDR, ACCEL_CONFIG::ACCEL_HPF)
             .await?;
 
         Ok(ACCEL_HPF::from(mode))
@@ -241,13 +321,8 @@ where
 
     /// Set gyro range, and update sensitivity accordingly
     pub async fn set_gyro_range(&mut self, range: GyroRange) -> Result<(), Error<E>> {
-        self.write_bits(
-            GYRO_CONFIG::ADDR,
-            GYRO_CONFIG::FS_SEL.bit,
-            GYRO_CONFIG::FS_SEL.length,
-            range as u8,
-        )
-        .await?;
+        self.write_bits(GYRO_CONFIG::ADDR, GYRO_CONFIG::FS_SEL, range as u8)
+            .await?;
 
         self.gyro_sens = range.sensitivity();
         Ok(())
@@ -256,11 +331,7 @@ where
     /// get current gyro range
     pub async fn get_gyro_range(&mut self) -> Result<GyroRange, Error<E>> {
         let byte = self
-            .read_bits(
-                GYRO_CONFIG::ADDR,
-                GYRO_CONFIG::FS_SEL.bit,
-                GYRO_CONFIG::FS_SEL.length,
-            )
+            .read_bits(GYRO_CONFIG::ADDR, GYRO_CONFIG::FS_SEL)
             .await?;
 
         Ok(GyroRange::from(byte))
@@ -268,13 +339,8 @@ where
 
     /// set accel range, and update sensitivy accordingly
     pub async fn set_accel_range(&mut self, range: AccelRange) -> Result<(), Error<E>> {
-        self.write_bits(
-            ACCEL_CONFIG::ADDR,
-            ACCEL_CONFIG::FS_SEL.bit,
-            ACCEL_CONFIG::FS_SEL.length,
-            range as u8,
-        )
-        .await?;
+        self.write_bits(ACCEL_CONFIG::ADDR, ACCEL_CONFIG::FS_SEL, range as u8)
+            .await?;
 
         self.accel_sens = range.sensitivity();
         Ok(())
@@ -283,11 +349,7 @@ where
     /// get current accel_range
     pub async fn get_accel_range(&mut self) -> Result<AccelRange, Error<E>> {
         let byte = self
-            .read_bits(
-                ACCEL_CONFIG::ADDR,
-                ACCEL_CONFIG::FS_SEL.bit,
-                ACCEL_CONFIG::FS_SEL.length,
-            )
+            .read_bits(ACCEL_CONFIG::ADDR, ACCEL_CONFIG::FS_SEL)
             .await?;
 
         Ok(AccelRange::from(byte))
@@ -473,15 +535,29 @@ where
         Ok((raw_temp / TEMP_SENSITIVITY) + TEMP_OFFSET)
     }
 
-    pub async fn read_mag(&mut self) -> Result<Vector3<f32>, Error<E>> {
+    pub async fn read_mag_raw(&mut self) -> Result<Vector3<i16>, Error<E>> {
         let mut data = [0u8; 6];
-        self.read_bytes(0x49, &mut data).await?; // EXT_SENS_DATA_00
+        self.read_bytes_mag(qmc5883p::reg::DATA_REG, &mut data)
+            .await?;
 
         Ok(Vector3::new(
-            i16::from_le_bytes([data[0], data[1]]) as f32 / Q16, // X (little-endian)
-            i16::from_le_bytes([data[2], data[3]]) as f32 / Q16, // Y
-            i16::from_le_bytes([data[4], data[5]]) as f32 / Q16, // Z
+            i16::from_le_bytes([data[0], data[1]]), // X (little-endian)
+            i16::from_le_bytes([data[2], data[3]]), // Y
+            i16::from_le_bytes([data[4], data[5]]), // Z
         ))
+    }
+
+    pub async fn read_mag_gauss(&mut self) -> Result<Vector3<f32>, Error<E>> {
+        let raw = self.read_mag_raw().await?;
+        let range = self
+            .read_bits(
+                qmc5883p::reg::Control2::ADDR,
+                qmc5883p::reg::Control2::RANGE,
+            )
+            .await?;
+        let range = qmc5883p::Range::from_u8(range).ok_or(Error::Conversion)?;
+
+        Ok(raw.map(|raw| raw as f32) / range.lsb_per_gauss())
     }
 
     /// Writes byte to register
@@ -496,6 +572,15 @@ where
         Ok(())
     }
 
+    pub async fn write_byte_mag(&mut self, reg: u8, byte: u8) -> Result<(), Error<E>> {
+        self.i2c
+            .write(self.mag_addr, &[reg, byte])
+            .await
+            .map_err(Error::I2c)?;
+
+        Ok(())
+    }
+
     /// Enables bit n at register address reg
     pub async fn write_bit(&mut self, reg: u8, bit_n: u8, enable: bool) -> Result<(), Error<E>> {
         let mut byte: [u8; 1] = [0; 1];
@@ -504,19 +589,36 @@ where
         Ok(self.write_byte(reg, byte[0]).await?)
     }
 
-    /// Write bits data at reg from start_bit to start_bit+length
-    pub async fn write_bits(
+    pub async fn write_bit_mag(
         &mut self,
-
         reg: u8,
-        start_bit: u8,
-        length: u8,
+        bit_n: u8,
+        enable: bool,
+    ) -> Result<(), Error<E>> {
+        let mut byte: [u8; 1] = [0; 1];
+        self.read_bytes_mag(reg, &mut byte).await?;
+        bits::set_bit(&mut byte[0], bit_n, enable);
+        Ok(self.write_byte_mag(reg, byte[0]).await?)
+    }
+
+    /// Write bits data at reg from start_bit to start_bit+length
+    pub async fn write_bits(&mut self, reg: u8, block: BitBlock, data: u8) -> Result<(), Error<E>> {
+        let mut byte: [u8; 1] = [0; 1];
+        self.read_bytes(reg, &mut byte).await?;
+        bits::set_bits(&mut byte[0], block.bit, block.length, data);
+        Ok(self.write_byte(reg, byte[0]).await?)
+    }
+
+    pub async fn write_bits_mag(
+        &mut self,
+        reg: u8,
+        block: BitBlock,
         data: u8,
     ) -> Result<(), Error<E>> {
         let mut byte: [u8; 1] = [0; 1];
-        self.read_bytes(reg, &mut byte).await?;
-        bits::set_bits(&mut byte[0], start_bit, length, data);
-        Ok(self.write_byte(reg, byte[0]).await?)
+        self.read_bytes_mag(reg, &mut byte).await?;
+        bits::set_bits(&mut byte[0], block.bit, block.length, data);
+        Ok(self.write_byte_mag(reg, byte[0]).await?)
     }
 
     /// Read bit n from register
@@ -526,11 +628,23 @@ where
         Ok(bits::get_bit(byte[0], bit_n))
     }
 
+    async fn read_bit_mag(&mut self, reg: u8, bit_n: u8) -> Result<u8, Error<E>> {
+        let mut byte: [u8; 1] = [0; 1];
+        self.read_bytes_mag(reg, &mut byte).await?;
+        Ok(bits::get_bit(byte[0], bit_n))
+    }
+
     /// Read bits at register reg, starting with bit start_bit, until start_bit+length
-    pub async fn read_bits(&mut self, reg: u8, start_bit: u8, length: u8) -> Result<u8, Error<E>> {
+    pub async fn read_bits(&mut self, reg: u8, block: BitBlock) -> Result<u8, Error<E>> {
         let mut byte: [u8; 1] = [0; 1];
         self.read_bytes(reg, &mut byte).await?;
-        Ok(bits::get_bits(byte[0], start_bit, length))
+        Ok(bits::get_bits(byte[0], block.bit, block.length))
+    }
+
+    pub async fn read_bits_mag(&mut self, reg: u8, block: BitBlock) -> Result<u8, Error<E>> {
+        let mut byte: [u8; 1] = [0; 1];
+        self.read_bytes_mag(reg, &mut byte).await?;
+        Ok(bits::get_bits(byte[0], block.bit, block.length))
     }
 
     /// Reads byte from register
@@ -538,6 +652,15 @@ where
         let mut byte: [u8; 1] = [0; 1];
         self.i2c
             .write_read(self.addr, &[reg], &mut byte)
+            .await
+            .map_err(Error::I2c)?;
+        Ok(byte[0])
+    }
+
+    pub async fn read_byte_mag(&mut self, reg: u8) -> Result<u8, Error<E>> {
+        let mut byte: [u8; 1] = [0; 1];
+        self.i2c
+            .write_read(self.mag_addr, &[reg], &mut byte)
             .await
             .map_err(Error::I2c)?;
         Ok(byte[0])
@@ -552,17 +675,11 @@ where
         Ok(())
     }
 
-    /// Write to a QMC5883L register via MPU6050's slave interface
-    pub async fn write_byte_mag(&mut self, reg: u8, value: u8) -> Result<(), Error<E>> {
-        self.write_byte(
-            0x25,               // I2C_SLV0_ADDR
-            self.mag_addr << 1, // QMC5883L write mode
-        )
-        .await?;
-        self.write_byte(0x26, reg).await?; // I2C_SLV0_REG
-        self.write_byte(0x27, 0x81).await?; // I2C_SLV0_CTRL: Enable + write 1 byte
-        self.write_byte(0x63, value).await?; // I2C_SLV0_DO
-
+    pub async fn read_bytes_mag(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), Error<E>> {
+        self.i2c
+            .write_read(self.mag_addr, &[reg], buf)
+            .await
+            .map_err(Error::I2c)?;
         Ok(())
     }
 }

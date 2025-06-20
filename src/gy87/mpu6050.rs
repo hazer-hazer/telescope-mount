@@ -1,3 +1,5 @@
+use crate::gy87::bits::BitBlock;
+
 /// Gyro Sensitivity
 ///
 /// Measurements are scaled like this:
@@ -52,11 +54,6 @@ pub const DEFAULT_MPU6050_ADDR: u8 = 0x68;
 pub const WHOAMI_REG: u8 = 0x75;
 pub const USER_CTRL: u8 = 0x6A;
 
-/// Describes a bit block from bit number 'bit' to 'bit'+'length'
-pub struct BitBlock {
-    pub bit: u8,
-    pub length: u8
-}
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug)]

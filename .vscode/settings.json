@@ -1,4 +1,4 @@
 {
   "rust-analyzer.check.allTargets": false,
-  "cSpell.words": ["deaccel", "decel", "MQTT"]
+  "cSpell.words": ["deaccel", "decel", "DOWNSAMPLING", "MQTT"]
 }

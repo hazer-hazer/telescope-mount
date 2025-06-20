@@ -1,3 +1,9 @@
+/// Describes a bit block from bit number 'bit' to 'bit'+'length'
+pub struct BitBlock {
+    pub bit: u8,
+    pub length: u8,
+}
+
 /// get bit n of byte
 pub fn get_bit(byte: u8, n: u8) -> u8 {
     (byte >> n) & 1

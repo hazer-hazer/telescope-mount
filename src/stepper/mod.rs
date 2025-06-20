@@ -117,7 +117,7 @@ impl<D: StepperDriver> Stepper<D> {
             .set_enabled(true)
             .await
             .map_err(|err| StepperError::Driver(err))?;
-
+ 
         while self.step().await {
             self.driver
                 .set_direction(self.dir_cw)

@@ -54,6 +54,7 @@ use esp_hal::{
     rng::Rng,
     time::{self, Rate},
     timer::{systimer::SystemTimer, timg::TimerGroup},
+    tsens::TemperatureSensor,
     Async,
 };
 use esp_println::println;
@@ -117,6 +118,7 @@ type Display = ssd1306::Ssd1306Async<I2CInterface<I2cDev>, DisplaySize, BasicMod
 static POSITION: Watch<CriticalSectionRawMutex, i32, 3> = Watch::new();
 static IMU: Watch<CriticalSectionRawMutex, ImuData, 2> = Watch::new();
 static STEPPER_ANGLE: Watch<CriticalSectionRawMutex, f32, 2> = Watch::new();
+static CHIP_TEMP: Watch<CriticalSectionRawMutex, f32, 2> = Watch::new();
 
 // TODO: Should be fetched from phone's GPS
 pub const DECLINATION: f32 = 0.20944;
@@ -253,6 +255,18 @@ async fn ui_task(display: Display) {
 }
 
 #[embassy_executor::task]
+async fn chip_temp_task(sensor: TemperatureSensor<'static>) {
+    let chip_temp_snd = CHIP_TEMP.sender();
+    sensor.power_up();
+    loop {
+        let temp = sensor.get_temperature().to_celsius();
+        chip_temp_snd.send(temp);
+        println!("Chip temp: {temp}C");
+        Timer::after_millis(5_000).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn imu_task(mut imu: Gy87<I2cDev>) {
     imu.init().await.unwrap();
     println!(
@@ -334,6 +348,13 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
 
     let position_snd = POSITION.sender();
     let mut position_rcv = POSITION.receiver().unwrap();
+    let mut chip_temp_rcv = CHIP_TEMP.receiver().unwrap();
+
+    let mut chip_temp_read = |_offset: usize, data: &mut [u8]| -> usize {
+        let temp = chip_temp_rcv.try_get().unwrap_or(0.0) as i16;
+        data.copy_from_slice(&temp.to_le_bytes());
+        2
+    };
 
     loop {
         println!("{:?}", ble.init().await);
@@ -344,7 +365,7 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
                 create_advertising_data(&[
                     AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
                     AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
-                    AdStructure::CompleteLocalName(esp_hal::chip!()),
+                    AdStructure::CompleteLocalName("telemount"),
                 ])
                 .unwrap()
             )
@@ -380,27 +401,48 @@ async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
             }
         };
 
-        gatt!([service {
-            uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
-            characteristics: [
-                characteristic {
-                    uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
-                    read: rf,
-                    write: wf,
-                },
-                characteristic {
-                    uuid: "957312e0-2354-11eb-9f10-fbc30a62cf38",
-                    write: wf2,
-                },
-                characteristic {
-                    name: "position",
-                    uuid: "987312e0-2354-11eb-9f10-fbc30a62cf38",
-                    notify: true,
-                    read: rf3,
-                    write: wf3,
-                },
-            ],
-        },]);
+        let temp_char_value = &[0u8; 8];
+
+        gatt!([
+            service {
+                uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
+                characteristics: [
+                    characteristic {
+                        uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
+                        read: rf,
+                        write: wf,
+                    },
+                    characteristic {
+                        uuid: "957312e0-2354-11eb-9f10-fbc30a62cf38",
+                        write: wf2,
+                    },
+                    characteristic {
+                        name: "position",
+                        uuid: "987312e0-2354-11eb-9f10-fbc30a62cf38",
+                        notify: true,
+                        read: rf3,
+                        write: wf3,
+                    },
+                ],
+            },
+            service {
+                uuid: "00001809-0000-1000-8000-00805f9b34fb",
+                characteristics: [
+                    characteristic {
+                        uuid: "00001809-0000-1000-8000-00805f9b34fb",
+                        notify: true,
+                        value: temp_char_value,
+                    },
+                    characteristic {
+                        name: "temp",
+                        uuid: "00002A1C-0000-1000-8000-00805f9b34fb",
+                        read: chip_temp_read,
+                        description: "ESP32C3 chip internal temperature sensor value",
+                        notify: true,
+                    },
+                ],
+            },
+        ]);
 
         let mut rng = bleps::no_rng::NoRng;
         let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
@@ -525,10 +567,14 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     spawner.must_spawn(ble_task(esp_wifi_ctrl, peripherals.BT));
-    spawner.must_spawn(imu_task(imu));
-    spawner.must_spawn(ui_task(display));
-    spawner.must_spawn(stepper_task(stepper));
-    spawner.must_spawn(encoder_task(as5600));
+    // spawner.must_spawn(imu_task(imu));
+    // spawner.must_spawn(ui_task(display));
+    // spawner.must_spawn(stepper_task(stepper));
+    // spawner.must_spawn(encoder_task(as5600));
+    spawner.must_spawn(chip_temp_task(
+        TemperatureSensor::new(peripherals.TSENS, esp_hal::tsens::Config::default())
+            .expect("Failed to initialize an internal temperature sensor"),
+    ));
 
     POSITION.sender().send(0);
 

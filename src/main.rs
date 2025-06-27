@@ -2,35 +2,28 @@
 #![no_main]
 #![deny(unused_must_use)]
 
+use crate::{
+    ble::temp::CHIP_TEMP,
+    cube::Cube,
+    gy87::{
+        madgwick::{MadgwickFilter, Rotation},
+        Gy87,
+    },
+    stepper::{a4988::A4988, Stepper, StepperConfig},
+};
 use alloc::{
     format,
     string::{String, ToString},
     vec::{self, Vec},
 };
 use as5600::asynch::As5600;
-use bleps::{
-    ad_structure::{
-        create_advertising_data, AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE,
-    },
-    async_attribute_server::AttributeServer,
-    asynch::Ble,
-    att::Uuid,
-    attribute_server::NotificationData,
-    gatt,
-};
-use core::{
-    borrow::Borrow as _,
-    cell::{Cell, RefCell},
-    f32::consts::{FRAC_PI_2, PI, TAU},
-};
+use bt_hci::controller::ExternalController;
+use core::f32::consts::PI;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_futures::block_on;
-use embassy_net::{dns::DnsQueryType, tcp::TcpSocket, Runner, StackResources};
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal, watch::Watch,
-};
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, watch::Watch};
+use embassy_time::Timer;
 use embedded_graphics::{
     mono_font::{ascii, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -58,41 +51,17 @@ use esp_hal::{
     Async,
 };
 use esp_println::println;
-use esp_wifi::{
-    ble::controller::BleConnector,
-    init,
-    wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
-    EspWifiController,
-};
-use futures::StreamExt;
-use log::{debug, error, info};
+use esp_wifi::{ble::controller::BleConnector, init, EspWifiController};
 use micromath::F32Ext;
 use nalgebra::Vector3;
-use rust_mqtt::{
-    client::{client::MqttClient, client_config::ClientConfig},
-    packet::v5::reason_codes::ReasonCode,
-    utils::rng_generator::CountingRng,
-};
 use ssd1306::{
-    mode::{
-        BasicMode, BufferedGraphicsMode, BufferedGraphicsModeAsync, DisplayConfig,
-        DisplayConfigAsync,
-    },
+    mode::{BasicMode, DisplayConfigAsync as _},
     prelude::I2CInterface,
     I2CDisplayInterface,
 };
 use static_cell::StaticCell;
-use uln2003::{StepperMotor, ULN2003};
 
-use crate::{
-    cube::Cube,
-    gy87::{
-        madgwick::{MadgwickFilter, Rotation},
-        Gy87,
-    },
-    stepper::{a4988::A4988, Stepper, StepperConfig},
-};
-
+pub mod ble;
 pub mod cube;
 mod gy87;
 mod stepper;
@@ -118,7 +87,6 @@ type Display = ssd1306::Ssd1306Async<I2CInterface<I2cDev>, DisplaySize, BasicMod
 static POSITION: Watch<CriticalSectionRawMutex, i32, 3> = Watch::new();
 static IMU: Watch<CriticalSectionRawMutex, ImuData, 2> = Watch::new();
 static STEPPER_ANGLE: Watch<CriticalSectionRawMutex, f32, 2> = Watch::new();
-static CHIP_TEMP: Watch<CriticalSectionRawMutex, f32, 2> = Watch::new();
 
 // TODO: Should be fetched from phone's GPS
 pub const DECLINATION: f32 = 0.20944;
@@ -262,7 +230,7 @@ async fn chip_temp_task(sensor: TemperatureSensor<'static>) {
         let temp = sensor.get_temperature().to_celsius();
         chip_temp_snd.send(temp);
         println!("Chip temp: {temp}C");
-        Timer::after_millis(5_000).await;
+        Timer::after_millis(3_000).await;
     }
 }
 
@@ -341,126 +309,135 @@ async fn imu_task(mut imu: Gy87<I2cDev>) {
 #[embassy_executor::task]
 async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
     let connector = BleConnector::new(&esp_wifi_ctrl, bt);
+    let controller: ExternalController<BleConnector<'_>, 20> = ExternalController::new(connector);
 
-    let now = || time::Instant::now().duration_since_epoch().as_millis();
-    let mut ble = Ble::new(connector, now);
-    println!("Connector created");
-
-    let position_snd = POSITION.sender();
-    let mut position_rcv = POSITION.receiver().unwrap();
-    let mut chip_temp_rcv = CHIP_TEMP.receiver().unwrap();
-
-    let mut chip_temp_read = |_offset: usize, data: &mut [u8]| -> usize {
-        let temp = chip_temp_rcv.try_get().unwrap_or(0.0) as i16;
-        data.copy_from_slice(&temp.to_le_bytes());
-        2
-    };
-
-    loop {
-        println!("{:?}", ble.init().await);
-        println!("{:?}", ble.cmd_set_le_advertising_parameters().await);
-        println!(
-            "{:?}",
-            ble.cmd_set_le_advertising_data(
-                create_advertising_data(&[
-                    AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-                    AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
-                    AdStructure::CompleteLocalName("telemount"),
-                ])
-                .unwrap()
-            )
-            .await
-        );
-        println!("{:?}", ble.cmd_set_le_advertise_enable(true).await);
-
-        println!("started advertising");
-
-        let mut rf = |_offset: usize, data: &mut [u8]| {
-            data[..20].copy_from_slice(&b"Hello Bare-Metal BLE"[..]);
-            17
-        };
-        let mut wf = |offset: usize, data: &[u8]| {
-            println!("RECEIVED: {} {:?}", offset, data);
-        };
-        let mut wf2 = |offset: usize, data: &[u8]| {
-            println!("RECEIVED: {} {:?}", offset, data);
-        };
-        let mut rf3 = |_offset: usize, data: &mut [u8]| {
-            // FIXME: Idk how but I need async attributes in bleps
-            data[0..4].copy_from_slice(&position_rcv.try_changed().unwrap_or(0).to_be_bytes());
-            4
-        };
-
-        let mut wf3 = |offset: usize, data: &[u8]| {
-            if offset == 0 && data.len() == 4 {
-                let new_pos = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                println!("Set position to {new_pos} ({data:?})");
-                position_snd.send(new_pos);
-            } else {
-                println!("Got wrong format for position write: offset={offset}, data={data:?}");
-            }
-        };
-
-        let temp_char_value = &[0u8; 8];
-
-        gatt!([
-            service {
-                uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
-                characteristics: [
-                    characteristic {
-                        uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
-                        read: rf,
-                        write: wf,
-                    },
-                    characteristic {
-                        uuid: "957312e0-2354-11eb-9f10-fbc30a62cf38",
-                        write: wf2,
-                    },
-                    characteristic {
-                        name: "position",
-                        uuid: "987312e0-2354-11eb-9f10-fbc30a62cf38",
-                        notify: true,
-                        read: rf3,
-                        write: wf3,
-                    },
-                ],
-            },
-            service {
-                uuid: "00001809-0000-1000-8000-00805f9b34fb",
-                characteristics: [
-                    characteristic {
-                        uuid: "00001809-0000-1000-8000-00805f9b34fb",
-                        notify: true,
-                        value: temp_char_value,
-                    },
-                    characteristic {
-                        name: "temp",
-                        uuid: "00002A1C-0000-1000-8000-00805f9b34fb",
-                        read: chip_temp_read,
-                        description: "ESP32C3 chip internal temperature sensor value",
-                        notify: true,
-                    },
-                ],
-            },
-        ]);
-
-        let mut rng = bleps::no_rng::NoRng;
-        let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
-
-        let mut notifier = || {
-            // TODO how to check if notifications are enabled for the characteristic?
-            // maybe pass something into the closure which just can query the characteristic
-            // value probably passing in the attribute server won't work?
-
-            async {
-                Timer::after_secs(100000000).await;
-                NotificationData::new(position_handle, &[])
-            }
-        };
-
-        srv.run(&mut notifier).await.unwrap();
-    }
+    ble::run(controller).await;
 }
+
+// #[embassy_executor::task]
+// async fn ble_task(esp_wifi_ctrl: &'static EspWifiController<'static>, bt: BT) {
+//     let connector = BleConnector::new(&esp_wifi_ctrl, bt);
+//     let controller = ExternalController::new(connector);
+
+//     let now = || time::Instant::now().duration_since_epoch().as_millis();
+//     let mut ble = Ble::new(connector, now);
+//     println!("Connector created");
+
+//     let position_snd = POSITION.sender();
+//     let mut position_rcv = POSITION.receiver().unwrap();
+//     let mut chip_temp_rcv = CHIP_TEMP.receiver().unwrap();
+
+//     let mut chip_temp_read = |_offset: usize, data: &mut [u8]| -> usize {
+//         let temp = chip_temp_rcv.try_get().unwrap_or(0.0) as i16;
+//         data.copy_from_slice(&temp.to_le_bytes());
+//         2
+//     };
+
+//     loop {
+//         println!("{:?}", ble.init().await);
+//         println!("{:?}", ble.cmd_set_le_advertising_parameters().await);
+//         println!(
+//             "{:?}",
+//             ble.cmd_set_le_advertising_data(
+//                 create_advertising_data(&[
+//                     AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+//                     AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
+//                     AdStructure::CompleteLocalName("telemount"),
+//                 ])
+//                 .unwrap()
+//             )
+//             .await
+//         );
+//         println!("{:?}", ble.cmd_set_le_advertise_enable(true).await);
+
+//         println!("started advertising");
+
+//         let mut rf = |_offset: usize, data: &mut [u8]| {
+//             data[..20].copy_from_slice(&b"Hello Bare-Metal BLE"[..]);
+//             17
+//         };
+//         let mut wf = |offset: usize, data: &[u8]| {
+//             println!("RECEIVED: {} {:?}", offset, data);
+//         };
+//         let mut wf2 = |offset: usize, data: &[u8]| {
+//             println!("RECEIVED: {} {:?}", offset, data);
+//         };
+//         let mut rf3 = |_offset: usize, data: &mut [u8]| {
+//             // FIXME: Idk how but I need async attributes in bleps
+//             data[0..4].copy_from_slice(&position_rcv.try_changed().unwrap_or(0).to_be_bytes());
+//             4
+//         };
+
+//         let mut wf3 = |offset: usize, data: &[u8]| {
+//             if offset == 0 && data.len() == 4 {
+//                 let new_pos = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+//                 println!("Set position to {new_pos} ({data:?})");
+//                 position_snd.send(new_pos);
+//             } else {
+//                 println!("Got wrong format for position write: offset={offset}, data={data:?}");
+//             }
+//         };
+
+//         let temp_char_value = &[0u8; 8];
+
+//         gatt!([
+//             service {
+//                 uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
+//                 characteristics: [
+//                     characteristic {
+//                         uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
+//                         read: rf,
+//                         write: wf,
+//                     },
+//                     characteristic {
+//                         uuid: "957312e0-2354-11eb-9f10-fbc30a62cf38",
+//                         write: wf2,
+//                     },
+//                     characteristic {
+//                         name: "position",
+//                         uuid: "987312e0-2354-11eb-9f10-fbc30a62cf38",
+//                         notify: true,
+//                         read: rf3,
+//                         write: wf3,
+//                     },
+//                 ],
+//             },
+//             service {
+//                 uuid: "00001809-0000-1000-8000-00805f9b34fb",
+//                 characteristics: [
+//                     characteristic {
+//                         uuid: "00001809-0000-1000-8000-00805f9b34fb",
+//                         notify: true,
+//                         value: temp_char_value,
+//                     },
+//                     characteristic {
+//                         name: "temp",
+//                         uuid: "00002A1C-0000-1000-8000-00805f9b34fb",
+//                         read: chip_temp_read,
+//                         description: "ESP32C3 chip internal temperature sensor value",
+//                         notify: true,
+//                     },
+//                 ],
+//             },
+//         ]);
+
+//         let mut rng = bleps::no_rng::NoRng;
+//         let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
+
+//         let mut notifier = || {
+//             // TODO how to check if notifications are enabled for the characteristic?
+//             // maybe pass something into the closure which just can query the characteristic
+//             // value probably passing in the attribute server won't work?
+
+//             async {
+//                 Timer::after_secs(100000000).await;
+//                 NotificationData::new(position_handle, &[])
+//             }
+//         };
+
+//         srv.run(&mut notifier).await.unwrap();
+//     }
+// }
 
 #[embassy_executor::task]
 async fn stepper_task(mut stepper: Stepper<A4988<Output<'static>, Output<'static>, NoPin>>) {
@@ -501,7 +478,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 72 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let mut rng = Rng::new(peripherals.RNG);
+    let rng = Rng::new(peripherals.RNG);
 
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(systimer.alarm0);
@@ -566,6 +543,7 @@ async fn main(spawner: Spawner) -> ! {
         ssd1306::rotation::DisplayRotation::Rotate0,
     );
 
+    // spawner.must_spawn(ble_task(esp_wifi_ctrl, peripherals.BT));
     spawner.must_spawn(ble_task(esp_wifi_ctrl, peripherals.BT));
     // spawner.must_spawn(imu_task(imu));
     // spawner.must_spawn(ui_task(display));

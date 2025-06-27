@@ -1,11 +1,6 @@
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor"
-rustflags = [
-  "-C",
-  "link-arg=-Tlinkall.x",
-  "-C",
-  "force-frame-pointers",
-]
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
 
 [build]
 target = "riscv32imc-unknown-none-elf"
@@ -17,3 +12,6 @@ build-std = ["alloc", "core"]
 ESP_LOG = "info"
 PASSWORD = "kityalove"
 SSID = "VOLTOS_EXT"
+
+[net]
+git-fetch-with-cli = true

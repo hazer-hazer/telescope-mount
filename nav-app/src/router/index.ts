@@ -25,7 +25,7 @@ const router = createRouter({
     {
       path: "/connect",
       name: "connect",
-      component: () => import("../views/ConnectionPage.vue"),
+      component: () => import("../views/ConnectionView.vue"),
     },
   ],
 });

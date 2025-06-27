@@ -6,54 +6,67 @@ name = "telescope-mount"
 version = "0.1.0"
 
 [dependencies]
-as5600 = {version = "0.8.0", features = ["async"]}
-bleps = {git = "https://github.com/bjoernQ/bleps", package = "bleps", rev = "a5148d8ae679e021b78f53fd33afb8bb35d0b62e", features = ["macros", "async"]}
+as5600 = { version = "0.8.0", features = ["async"] }
+bt-hci = { version = "0.2.1", features = ["embassy-time", "uuid", "log"] }
 critical-section = "1.2.0"
 embassy-embedded-hal = "0.3.0"
-embassy-executor = {version = "0.7.0", features = ["task-arena-size-20480", "arch-riscv32", "executor-thread"]}
-embassy-futures = "0.1.1"
-embassy-net = {version = "0.6.0", features = [
-  "tcp",
-  "udp",
-  "dhcpv4",
-  "medium-ethernet",
-  "proto-ipv6",
-  "log",
-  "dns",
-]}
-embassy-sync = {version = "0.6.2"}
-embassy-time = "0.4.0"
-embedded-graphics = {version = "0.8.1", features = ["nalgebra_support"]}
+embassy-executor = { version = "0.7", features = [
+  "task-arena-size-20480",
+  "arch-riscv32",
+  # "executor-thread",
+] }
+embassy-futures = "0.1"
+# embassy-net = { version = "0.7", features = [
+#   "tcp",
+#   "udp",
+#   "dhcpv4",
+#   "medium-ethernet",
+#   "proto-ipv6",
+#   "log",
+#   "dns",
+# ] }
+embassy-sync = { version = "0.6.0" }
+embassy-time = "0.4"
+embedded-graphics = { version = "0.8.1", features = ["nalgebra_support"] }
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
-embedded-hal-bus = {version = "0.3.0", features = ["async"]}
-esp-alloc = {version = "0.7.0"}
-esp-backtrace = {version = "0.15.1", features = [
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
+esp-alloc = { version = "0.7" }
+esp-backtrace = { version = "0.16.0", features = [
   "esp32c3",
   "exception-handler",
   "panic-handler",
   "println",
-]}
-esp-hal = {version = "1.0.0-beta.0", features = ["esp32c3", "unstable"]}
-esp-hal-embassy = {version = "0.7.0", features = ["esp32c3"]}
-esp-println = {version = "0.13.1", features = ["esp32c3", "log"]}
-esp-wifi = {version = "0.13.0", features = [
+] }
+esp-hal = { version = "^1.0.0-beta.0", features = ["esp32c3", "unstable"] }
+esp-hal-embassy = { version = "0.7", features = ["esp32c3"] }
+esp-println = { version = "0.14.0", features = ["esp32c3", "log-04"] }
+esp-wifi = { version = "0.13.0", features = [
   "esp32c3",
-  "wifi",
+  # "wifi",
+  "builtin-scheduler",
+  "log",
   "ble",
   "esp-alloc",
-  "log",
-]}
-futures = {version = "0.3.31", default-features = false}
+  # "log",
+] }
+futures = { version = "0.3", default-features = false }
 heapless = "0.8.0"
-log = "0.4.22"
+log = "0.4"
 micromath = "2.1.0"
-nalgebra = {version = "0.33.2", default-features = false, features = ["libm"]}
+nalgebra = { version = "0.33.2", default-features = false, features = ["libm"] }
 num-derive = "0.4.2"
-num-traits = {version = "0.2.19", default-features = false}
-rust-mqtt = {version = "0.3.0", default-features = false}
-ssd1306 = {version = "0.10.0", features = ["async"]}
-static_cell = {version = "2.0", features = ["nightly"]}
+num-traits = { version = "0.2.19", default-features = false }
+# rust-mqtt = { version = "0.3.0", default-features = false }
+ssd1306 = { version = "0.10.0", features = ["async"] }
+static_cell = { version = "2.1", features = [] }
+trouble-host = { version = "0.1.0", features = [
+  "derive",
+  "peripheral",
+  "gatt",
+  "scan",
+  "log",
+] }
 uln2003 = "0.4.0"
 
 [profile.dev]
@@ -62,10 +75,10 @@ uln2003 = "0.4.0"
 opt-level = "s"
 
 [profile.release]
-codegen-units = 1 # LLVM can perform better optimizations using a single thread
-debug = 2 
-debug-assertions = false 
-incremental = false 
-lto = 'thin' 
-opt-level = 's' 
+codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'thin'
+opt-level = 's'
 overflow-checks = false
